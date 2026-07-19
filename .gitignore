@@ -1,0 +1,14 @@
+# Java / Maven
+**/target/
+
+# AWS CDK / Node
+**/node_modules/
+**/cdk.out/
+**/dist/
+.pnpm-store/
+
+# IDE and operating system
+.idea/
+.vscode/
+*.iml
+.DS_Store

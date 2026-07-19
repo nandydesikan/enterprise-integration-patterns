@@ -1,0 +1,33 @@
+spring:
+  application:
+    name: service-mediation-layer
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+server:
+  shutdown: graceful
+
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  health:
+    liveness-state:
+      enabled: true
+    readiness-state:
+      enabled: true
+
+mediation:
+  persistence-mode: ${MEDIATION_PERSISTENCE_MODE:in-memory}
+  recovery-batch-size: ${MEDIATION_RECOVERY_BATCH_SIZE:50}
+  recovery-lease-duration: ${MEDIATION_RECOVERY_LEASE_DURATION:PT30S}
+
+logging:
+  pattern:
+    level: "%5p [workflowId:%X{workflowId:-} operationId:%X{operationId:-}]"

@@ -1,0 +1,26 @@
+{
+  "name": "service-mediation-ecs",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "deploy": "cdk deploy",
+    "test": "jest --runInBand"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.261.0",
+    "constructs": "10.7.0"
+  },
+  "devDependencies": {
+    "@types/jest": "30.0.0",
+    "@types/node": "24.10.0",
+    "aws-cdk": "2.1132.0",
+    "jest": "30.2.0",
+    "ts-jest": "29.4.5",
+    "ts-node": "10.9.2",
+    "typescript": "5.9.3"
+  }
+}

@@ -2,7 +2,7 @@ version: 2
 
 updates:
   - package-ecosystem: "maven"
-    directory: "/"
+    directory: "/software/service-mediation-layer"
     schedule:
       interval: "weekly"
 
@@ -11,3 +11,7 @@ updates:
     schedule:
       interval: "weekly"
 
+  - package-ecosystem: "npm"
+    directory: "/infrastructure/ecs"
+    schedule:
+      interval: "weekly"

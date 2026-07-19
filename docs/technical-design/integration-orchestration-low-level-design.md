@@ -14,7 +14,10 @@ The design focuses on the hard parts of enterprise integration:
 
 - durable workflow progress;
 - explicit transaction boundaries;
-- idempotent request and downstream operation handling;
+- ingress, command, and event-consumption idempotency;
+- recovery polling for retryable, incomplete, and uncertain executions;
+- durable preservation of failed-operation payloads beyond broker and DLQ retention;
+- compensating transactions executed through an independently recoverable workflow;
 - recovery from partial and uncertain failures;
 - anti-corruption adapters between domain contracts;
 - reliable event publication;
@@ -128,6 +131,8 @@ io.github.nandydesikan.eip.returns
 │       ├── PaymentsPort
 │       ├── WorkflowRepository
 │       ├── StepExecutionRepository
+│       ├── RecoveryPayloadRepository
+│       ├── CompensationRepository
 │       ├── OutboxRepository
 │       ├── ClockPort
 │       └── IdentifierPort
@@ -236,6 +241,8 @@ It contains:
 - downstream reference;
 - failure classification;
 - response summary;
+- durable recovery-payload reference when replay may outlive broker retention;
+- compensation operation reference when a corrective business action is required;
 - created and updated timestamps.
 
 `StepExecutionStatus`:
@@ -270,7 +277,7 @@ Technical failures change `WorkflowStatus` and `StepExecutionStatus`; they do no
 
 ## 8. Idempotency model
 
-Two idempotency boundaries are required.
+Three idempotency boundaries are required.
 
 ### Ingress idempotency
 
@@ -289,7 +296,7 @@ Behavior:
 - same key and different fingerprint: reject with conflict;
 - new key: create a new workflow.
 
-### Downstream operation idempotency
+### Downstream command idempotency
 
 Every logical external operation receives a stable operation identity.
 
@@ -299,9 +306,31 @@ The operation identity is derived from:
 workflow ID + step name + logical occurrence
 ```
 
-Retries reuse the same operation identity. Attempt count is not part of the downstream idempotency identity.
+Retries, redispatch, reconciliation, and process restarts reuse the same operation identity. Attempt count is not part of the downstream idempotency identity.
 
-This allows Shipping or Payments to recognize repeated delivery of the same logical command.
+A separate attempt identity is generated for each technical invocation. This preserves a stable business-operation identity while allowing every call, retry, and polling request to remain observable.
+
+```text
+operation ID = stable logical command identity
+attempt ID   = unique technical invocation identity
+```
+
+This allows Shipping or Payments to recognize repeated delivery of the same logical command without losing per-attempt telemetry.
+
+### Event-consumption idempotency
+
+Every consumed event has a stable message identity.
+
+The consumer records:
+
+- consumer name;
+- message ID;
+- workflow ID;
+- processing timestamp.
+
+The event transaction claims the message identity, applies the legal workflow transition, writes any resulting outbox event, and commits atomically.
+
+A duplicate message becomes a safe no-op.
 
 ## 9. Request fingerprinting
 
@@ -364,7 +393,12 @@ occurrence               integer
 request_fingerprint      varchar
 status                   varchar
 attempt_count            integer
-next_retry_at            timestamp nullable
+next_action_at           timestamp nullable
+last_attempt_at          timestamp nullable
+reconciliation_count     integer
+recovery_deadline        timestamp nullable
+claimed_by               varchar nullable
+claimed_until            timestamp nullable
 downstream_reference     varchar nullable
 failure_classification   varchar nullable
 response_summary         jsonb nullable
@@ -377,6 +411,80 @@ Constraints:
 
 - unique `(workflow_id, step_name, occurrence)`;
 - optimistic-lock version.
+
+### `processed_message`
+
+```text
+consumer_name            varchar
+message_id               varchar
+workflow_id              UUID
+processed_at             timestamp
+```
+
+Constraint:
+
+- unique `(consumer_name, message_id)`.
+
+### `recovery_payload`
+
+Stores the minimum encrypted payload required to replay, reconcile, or compensate an operation after broker or DLQ retention has elapsed.
+
+```text
+recovery_payload_id       UUID primary key
+workflow_id               UUID
+operation_id              UUID
+payload_type              varchar
+schema_version            integer
+encrypted_payload         bytea
+payload_fingerprint       varchar
+source_message_id         varchar nullable
+source_dlq                varchar nullable
+broker_first_seen_at      timestamp nullable
+broker_expires_at         timestamp nullable
+retention_until           timestamp
+status                    varchar
+created_at                timestamp
+updated_at                timestamp
+```
+
+Constraints:
+
+- unique operation identity for the same payload purpose;
+- payload fingerprint conflict detection;
+- application-defined retention policy;
+- encryption at rest;
+- no secrets or sensitive fields in plaintext metadata.
+
+`recovery_payload` is not an unrestricted message archive. It stores only the data required to continue or safely reverse the business operation.
+
+### `compensation_execution`
+
+Tracks a compensating transaction independently from the failed forward operation.
+
+```text
+compensation_id           UUID primary key
+workflow_id               UUID
+original_operation_id     UUID
+compensation_operation_id UUID
+compensation_type         varchar
+status                    varchar
+attempt_count             integer
+next_action_at            timestamp nullable
+claimed_by                varchar nullable
+claimed_until             timestamp nullable
+downstream_reference      varchar nullable
+failure_classification    varchar nullable
+version                   bigint
+created_at                timestamp
+updated_at                timestamp
+```
+
+Constraints:
+
+- unique `(original_operation_id, compensation_type)`;
+- stable compensation operation identity;
+- optimistic-lock version;
+- bounded retry and escalation policy.
 
 ### `workflow_transition`
 
@@ -458,14 +566,17 @@ When the request may have reached the participant but no definitive response exi
 
 ## 12. Concurrency control
 
-The first implementation uses optimistic concurrency.
+The implementation uses optimistic concurrency for workflow advancement and a short database lease for recovery work.
 
 - `workflow_instance.version` prevents two workers from advancing the same workflow from the same version.
 - `step_execution.version` protects concurrent updates to an operation.
 - unique constraints prevent duplicate logical operations.
 - a worker that loses the optimistic-lock race reloads state and re-evaluates whether work remains.
+- recovery workers claim bounded batches using PostgreSQL `FOR UPDATE SKIP LOCKED`.
+- the database row lock is released before any network call.
+- `claimed_by` and `claimed_until` provide a short processing lease after the claim transaction commits.
 
-The first version does not implement distributed leases. Lease-based execution is a documented production evolution, not a prerequisite for the portfolio slice.
+The first version does not introduce a separate distributed-lock service.
 
 ## 13. Failure classification
 
@@ -546,7 +657,255 @@ The implementation will not retry:
 - authorization failures without refreshed credentials;
 - uncertain outcomes.
 
-## 15. Compensation and reconciliation
+
+## 15. Recovery polling
+
+The public artifact uses the term **recovery polling** rather than clawback polling.
+
+A scheduled recovery coordinator scans due `StepExecution` records whose next action is one of:
+
+```text
+RETRY_SCHEDULED
+OUTCOME_UNKNOWN
+RECONCILIATION_REQUIRED
+WAITING_FOR_CONFIRMATION
+```
+
+Only rows whose `next_action_at` is due and whose lease is absent or expired are eligible.
+
+### Recovery flow
+
+```text
+Find due step executions
+→ claim a bounded batch
+→ reload current workflow state
+→ choose retry, reconciliation, or escalation
+→ call the participant outside the database transaction
+→ record the definitive or still-unknown outcome
+→ advance, reschedule, compensate, or route to manual review
+```
+
+### Claim transaction
+
+One short transaction:
+
+1. select eligible rows using `FOR UPDATE SKIP LOCKED`;
+2. assign `claimed_by`;
+3. assign `claimed_until`;
+4. commit.
+
+No network request is made while the database lock is held.
+
+### Participant call
+
+The worker uses the original stable operation identity to:
+
+- retry a definitively unexecuted operation;
+- query for an uncertain prior outcome;
+- request compensation;
+- check for an awaited confirmation.
+
+Every technical invocation receives a new attempt identity.
+
+### Outcome transaction
+
+One transaction:
+
+1. reload the workflow and step execution;
+2. verify that the lease and operation still apply;
+3. confirm that another worker or event consumer has not already advanced the workflow;
+4. persist the participant result;
+5. advance or reschedule the workflow;
+6. write the corresponding outbox event;
+7. release the lease.
+
+A stale recovery result becomes a no-op when the workflow has already progressed.
+
+### Bounded polling behavior
+
+The recovery coordinator applies:
+
+- bounded batch size;
+- bounded worker concurrency;
+- exponential delay and jitter;
+- participant-specific rate limits;
+- maximum reconciliation age;
+- recovery deadline;
+- manual-review escalation;
+- backlog and oldest-item metrics.
+
+The implementation does not continuously poll every incomplete workflow.
+
+## 16. Durable recovery beyond DLQ retention
+
+A message broker or dead-letter queue is transport infrastructure, not the system of record for long-lived recovery.
+
+The design must not wait until a message is already past the DLQ retention limit. Once the broker deletes it, the payload may be irretrievable.
+
+The system therefore preserves recovery data before expiry through two complementary paths.
+
+### Primary path: persist recovery intent with workflow state
+
+When an operation first becomes retryable, outcome-unknown, or compensation-required, the application writes the minimum replayable payload to `recovery_payload` in the same local transaction that records the workflow decision.
+
+This is the preferred path because recovery does not depend on a later DLQ archival job succeeding.
+
+### Secondary path: DLQ archival safeguard
+
+A separate DLQ archival worker consumes or inspects dead-lettered messages before their broker expiry time.
+
+For each eligible message it:
+
+1. validates the message envelope and schema version;
+2. derives or reads the stable operation identity;
+3. verifies whether a durable recovery payload already exists;
+4. persists the minimum encrypted replay payload when absent;
+5. records the source message ID, DLQ identity, and broker expiry time;
+6. marks the archival result idempotently.
+
+The archival worker does not immediately replay business operations. Its responsibility is durable preservation.
+
+### Why SQL persistence is used
+
+A relational recovery ledger provides:
+
+- retention beyond broker limits;
+- indexed recovery by workflow and operation identity;
+- transactionally consistent status changes;
+- optimistic concurrency;
+- auditable retry and compensation history;
+- controlled deletion after business and compliance retention periods;
+- operational queries for backlog age and manual review.
+
+For the reference implementation, PostgreSQL represents a service such as Aurora PostgreSQL without binding the design to a particular cloud provider.
+
+### Recovery-payload lifecycle
+
+```text
+AVAILABLE
+CLAIMED
+REPLAY_PENDING
+COMPENSATION_PENDING
+COMPLETED
+MANUAL_REVIEW
+EXPIRED
+```
+
+Payload deletion occurs only after:
+
+- the workflow has reached a terminal state;
+- no retry, reconciliation, or compensation remains;
+- the configured business-retention period has elapsed.
+
+### Payload safety
+
+The durable recovery store must:
+
+- encrypt payload content;
+- retain only fields required for replay or compensation;
+- version the payload schema;
+- avoid storing access tokens and transient credentials;
+- support cryptographic erasure or scheduled deletion;
+- redact sensitive fields from logs and metrics;
+- validate the fingerprint before execution.
+
+## 17. Compensating transaction workflow
+
+A compensating transaction is a new business operation that mitigates or reverses the effect of a previously confirmed operation. It is not a database rollback.
+
+Examples:
+
+- cancel a return-shipment reservation;
+- release an inventory hold;
+- reverse a provisional authorization;
+- issue a corrective ledger entry.
+
+### Compensation creation
+
+When the forward workflow reaches a state requiring compensation, one transaction:
+
+1. validates that compensation is legal for the current business phase;
+2. creates a `compensation_execution` record;
+3. assigns a stable compensation operation identity;
+4. links the durable recovery payload;
+5. marks the workflow `COMPENSATION_REQUIRED`;
+6. writes a compensation-requested outbox event.
+
+The compensation operation identity remains stable across all attempts.
+
+### Separate compensation poller
+
+A dedicated compensation coordinator polls due `compensation_execution` rows independently of the normal forward-workflow recovery poller.
+
+```text
+Find due compensation work
+→ claim a bounded batch
+→ load original operation and recovery payload
+→ validate current workflow state
+→ invoke compensating command outside the database transaction
+→ record success, retryable failure, uncertain outcome, or escalation
+```
+
+The separation provides:
+
+- independent scaling and rate limits;
+- distinct retry budgets;
+- clearer operational ownership;
+- isolation from forward-workflow backlog;
+- dedicated alarms and manual-review queues.
+
+### Compensation claim transaction
+
+One short transaction:
+
+1. select due rows with `FOR UPDATE SKIP LOCKED`;
+2. set `claimed_by` and `claimed_until`;
+3. increment or reserve the technical attempt;
+4. commit.
+
+No remote call occurs while the row lock is held.
+
+### Compensation outcome transaction
+
+On definitive success:
+
+1. reload the workflow and compensation record;
+2. verify claim ownership and current workflow version;
+3. persist the participant reference;
+4. mark the compensation `SUCCEEDED`;
+5. transition the workflow to the appropriate compensated or terminal phase;
+6. write the outbox event;
+7. release the claim.
+
+On retryable failure:
+
+- retain the same compensation operation identity;
+- increment attempt count;
+- calculate `next_action_at`;
+- release the claim.
+
+On uncertain outcome:
+
+- mark the compensation `OUTCOME_UNKNOWN`;
+- reconcile using the same compensation operation identity;
+- do not issue a second compensating command blindly.
+
+On exhausted recovery:
+
+- mark `MANUAL_REVIEW`;
+- preserve the encrypted payload and complete audit history;
+- alert on the oldest unresolved compensation.
+
+### Relationship to DLQ replay
+
+DLQ replay and compensation are not interchangeable.
+
+- **Replay** retries the original logical operation when it is confirmed safe to do so.
+- **Reconciliation** discovers whether an uncertain original or compensating operation already took effect.
+- **Compensation** issues a separate corrective business command after a confirmed forward effect.
+- **Manual review** handles cases where neither automated replay nor compensation is safe.
+
+## 18. Compensation and reconciliation
 
 Compensation is not described as rollback.
 
@@ -568,7 +927,7 @@ Possible reconciliation results:
 
 After the physical item is received, the design does not attempt to "undo" receipt. It moves forward through refund or manual resolution.
 
-## 16. Ports and anti-corruption adapters
+## 19. Ports and anti-corruption adapters
 
 ### ReturnPolicyPort
 
@@ -593,7 +952,7 @@ Supports:
 
 The Payments adapter prevents Payments-specific models and error codes from leaking into the workflow aggregate.
 
-## 17. API surface
+## 20. API surface
 
 ### Create workflow
 
@@ -636,7 +995,7 @@ POST /internal/test/returns/{workflowId}/item-received
 
 The endpoint is excluded from production profiles.
 
-## 18. Outbox behavior
+## 21. Outbox behavior
 
 Workflow state and its corresponding event are written in the same local transaction.
 
@@ -651,7 +1010,7 @@ Delivery is at least once.
 
 Consumers must use the event ID or operation identity for deduplication. The outbox does not claim exactly-once end-to-end delivery.
 
-## 19. Observability
+## 22. Observability
 
 ### Correlation fields
 
@@ -677,7 +1036,11 @@ Baseline metrics:
 - uncertain outcomes;
 - reconciliation age;
 - workflows stalled beyond threshold;
-- outbox publication lag.
+- outbox publication lag;
+- durable recovery payloads nearing retention expiry;
+- archived DLQ payload count and age;
+- compensation backlog size and oldest pending compensation;
+- compensation retries, uncertain outcomes, and manual-review escalations.
 
 ### Alerts
 
@@ -690,7 +1053,7 @@ Production evolution:
 - outbox lag;
 - optimistic-lock conflict spike.
 
-## 20. Security boundaries
+## 23. Security boundaries
 
 The reference implementation demonstrates the placement of security controls without embedding real credentials or provider-specific infrastructure.
 
@@ -703,11 +1066,15 @@ Controls:
 - secrets supplied through environment variables;
 - sensitive payload fields excluded from logs;
 - least-privilege database and service permissions;
-- immutable audit records for workflow transitions.
+- immutable audit records for workflow transitions;
+- encrypted durable recovery payloads;
+- schema-version and fingerprint validation before replay;
+- retention and deletion policies for recovery data;
+- no persistence of transient credentials inside replay payloads.
 
 Authentication plumbing is not the focus of the first slice. A lightweight local security configuration may be used, with the production trust model documented separately.
 
-## 21. Test strategy
+## 24. Test strategy
 
 ### Domain tests
 
@@ -722,7 +1089,11 @@ Authentication plumbing is not the focus of the first slice. A lightweight local
 - conflicting idempotency reuse is rejected;
 - retryable failure schedules retry;
 - uncertain outcome enters reconciliation;
-- same downstream operation identity is reused across attempts;
+- recovery polling claims only due, unleased work;
+- concurrent recovery workers do not process the same step;
+- the same downstream operation identity is reused across retries and polling;
+- every technical invocation receives a distinct attempt identity;
+- duplicate consumed events become safe no-ops;
 - confirmed downstream result advances the workflow.
 
 ### Persistence integration tests
@@ -746,11 +1117,18 @@ Minimum credible scenario suite:
 5. shipment timeout followed by successful reconciliation;
 6. concurrent attempts to advance one workflow;
 7. refund rejection;
-8. process restart followed by resume from persisted state;
-9. outbox publication failure followed by redelivery;
-10. cancellation before item receipt followed by shipment compensation.
+8. process restart followed by recovery polling from persisted state;
+9. two recovery workers competing for the same due step;
+10. duplicate item-received event delivery;
+11. outbox publication failure followed by redelivery;
+12. cancellation before item receipt followed by shipment compensation;
+13. DLQ payload archived idempotently before broker retention expires;
+14. recovery succeeds after the original DLQ message is no longer available;
+15. duplicate compensation polling does not issue duplicate corrective effects;
+16. uncertain compensation outcome enters reconciliation rather than blind retry;
+17. expired recovery payload is never executed.
 
-## 22. Deliberate exclusions
+## 25. Deliberate exclusions
 
 The first implementation will not include:
 
@@ -765,11 +1143,12 @@ The first implementation will not include:
 - a universal canonical enterprise model;
 - arbitrary plugin loading;
 - a generic policy engine;
-- full production identity-provider integration.
+- full production identity-provider integration;
+- treating the message broker or DLQ as the durable system of record.
 
 These exclusions keep the artifact explainable and make the difficult correctness behavior visible.
 
-## 23. Planned implementation increments
+## 26. Planned implementation increments
 
 ### Increment 1 — Domain and application core
 
@@ -788,21 +1167,32 @@ These exclusions keep the artifact explainable and make the difficult correctnes
 - step-execution persistence;
 - optimistic concurrency tests.
 
-### Increment 3 — External operation handling
+### Increment 3 — External operation handling and recovery
 
 - Shipping and Payments adapters;
 - retry classification;
 - uncertain-outcome reconciliation;
-- compensation flow.
+- recovery polling coordinator;
+- bounded work claiming and short leases;
+- durable recovery-payload persistence;
+- DLQ archival safeguard.
 
-### Increment 4 — API and outbox
+### Increment 4 — Compensation workflow
+
+- compensation execution model;
+- dedicated compensation poller;
+- stable compensation operation identity;
+- retry and uncertain-outcome handling;
+- manual-review escalation.
+
+### Increment 5 — API and outbox
 
 - REST API;
 - outbox persistence and publisher;
 - workflow query model;
 - scenario tests.
 
-### Increment 5 — Operational polish
+### Increment 6 — Operational polish
 
 - structured logging;
 - metrics;
@@ -810,21 +1200,26 @@ These exclusions keep the artifact explainable and make the difficult correctnes
 - architecture decision records;
 - concise repository README.
 
-## 24. Interview narrative
+## 27. Interview narrative
 
 The design should support a 10–15 minute explanation:
 
 1. Why direct service chaining is insufficient.
 2. Why the orchestrator owns workflow progress but not domain state.
 3. How stable operation identity prevents duplicate effects.
-4. Why network calls are outside database transactions.
-5. How definitive failure differs from uncertain outcome.
-6. Why reconciliation is sometimes safer than retry.
-7. How optimistic locking and unique constraints protect execution.
-8. How state changes and events are committed atomically.
-9. Why the first implementation is concrete rather than generic.
-10. How the design could evolve under production scale.
+4. Why attempt identity remains separate from operation identity.
+5. Why network calls are outside database transactions.
+6. How definitive failure differs from uncertain outcome.
+7. Why recovery polling reconciles before redispatch.
+8. How optimistic locking, row claiming, leases, and unique constraints protect execution.
+9. How duplicate events become safe no-ops.
+10. Why DLQ retention is not a durable recovery strategy.
+11. How failed-operation payloads survive beyond broker retention.
+12. Why compensation uses a separate stable operation identity and polling workflow.
+13. How state changes and events are committed atomically.
+14. Why the first implementation is concrete rather than generic.
+15. How the design could evolve under production scale.
 
-## 25. Provenance
+## 28. Provenance
 
 This repository is an independent implementation of publicly documented distributed-systems and enterprise-integration patterns. It contains no employer source code, confidential documentation, proprietary schemas, internal identifiers, or production data.

@@ -21,7 +21,8 @@ The repository focuses on correctness under partial failure: stable operation id
 ├── infrastructure/
 │   └── ecs/                        # AWS ECS Fargate deployment assets
 ├── docs/
-│   └── technical-design/           # LLD and architecture diagrams
+│   ├── technical-design/           # LLD and architecture diagrams
+│   └── implementation/             # Reproducible build and verification runbooks
 └── .github/                         # Dependency and CI automation
 ```
 
@@ -36,18 +37,15 @@ The split is intentional: application behavior can be tested without AWS, while 
 
 ## Current executable increment
 
-The first increment implements workflow creation and query with deterministic request fingerprinting and in-memory idempotency. It establishes the architectural boundaries and tests before durable PostgreSQL persistence is introduced.
-
-The in-memory adapter is a reference-stage component, not a production durability claim. The next increment replaces it with PostgreSQL, Flyway migrations, optimistic concurrency, and atomic workflow/outbox persistence as specified in the LLD.
+The current increment implements workflow creation and query with deterministic request fingerprinting. It offers a database-free in-memory profile for fast demonstrations and a PostgreSQL profile with Flyway, durable idempotency, transition history, and atomic workflow/outbox persistence.
 
 ## Run locally
 
-Prerequisites: Java 25 and Maven 3.9+.
+Prerequisites: Java 25 and Maven 3.9+. From the repository root:
 
 ```bash
-cd software/service-mediation-layer
 mvn verify
-mvn spring-boot:run
+mvn -pl :service-mediation-layer spring-boot:run
 ```
 
 Create a workflow:
@@ -73,15 +71,15 @@ GET /actuator/health/readiness
 - [Low-level implementation diagram](docs/technical-design/integration-orchestration-low-level-technical-implementation.png)
 - [Deterministic recovery and compensation](docs/technical-design/compensating-transactions-deterministic-recovery-orchestration.png)
 - [ECS deployment guide](infrastructure/ecs/README.md)
+- [Build and verification runbook](docs/implementation/verify-design.md)
 
 ## Implementation sequence
 
-1. Domain and application core — current increment.
-2. PostgreSQL persistence, Flyway schema, and ingress idempotency races.
-3. Participant adapters, failure classification, retry, and reconciliation.
-4. Independently recoverable compensating transactions.
-5. Transactional outbox publishing and event-consumption idempotency.
-6. Production observability, CI/CD, and scenario-level tests.
+1. Domain, application core, PostgreSQL persistence, and atomic outbox write — current increment.
+2. Participant adapters, failure classification, retry, and reconciliation.
+3. Independently recoverable compensating transactions.
+4. Outbox relay publication and event-consumption idempotency.
+5. Production observability and scenario-level tests.
 
 ## Provenance
 

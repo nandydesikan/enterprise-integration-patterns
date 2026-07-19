@@ -6,6 +6,7 @@ import io.github.nandydesikan.eip.returns.application.port.IdentifierPort;
 import io.github.nandydesikan.eip.returns.application.port.WorkflowRepository;
 import io.github.nandydesikan.eip.returns.domain.ReturnWorkflow;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class StartReturnWorkflow {
@@ -24,6 +25,7 @@ public class StartReturnWorkflow {
         this.clockPort = clockPort;
     }
 
+    @Transactional
     public WorkflowRepository.StartResult handle(StartReturnWorkflowCommand command) {
         var candidate = ReturnWorkflow.start(
                 identifierPort.nextWorkflowId(),

@@ -1,5 +1,5 @@
 import { App } from 'aws-cdk-lib';
-import { Template } from 'aws-cdk-lib/assertions';
+import { Match, Template } from 'aws-cdk-lib/assertions';
 import { ServiceMediationStack } from '../lib/service-mediation-stack';
 
 describe('ServiceMediationStack', () => {
@@ -52,6 +52,29 @@ describe('ServiceMediationStack', () => {
     template.hasResourceProperties('AWS::ElasticLoadBalancingV2::TargetGroup', {
       HealthCheckPath: '/actuator/health/readiness',
       Matcher: { HttpCode: '200' },
+    });
+  });
+
+  test('runs PostgreSQL privately with encrypted storage and generated credentials', () => {
+    template.hasResourceProperties('AWS::RDS::DBInstance', {
+      DBName: 'mediation',
+      Engine: 'postgres',
+      PubliclyAccessible: false,
+      StorageEncrypted: true,
+    });
+
+    template.hasResourceProperties('AWS::ECS::TaskDefinition', {
+      ContainerDefinitions: [
+        {
+          Environment: Match.arrayWith([
+            { Name: 'SPRING_PROFILES_ACTIVE', Value: 'postgres' },
+          ]),
+          Secrets: Match.arrayWith([
+            Match.objectLike({ Name: 'DATABASE_USERNAME' }),
+            Match.objectLike({ Name: 'DATABASE_PASSWORD' }),
+          ]),
+        },
+      ],
     });
   });
 });

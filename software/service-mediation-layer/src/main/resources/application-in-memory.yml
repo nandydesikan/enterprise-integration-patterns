@@ -1,0 +1,12 @@
+spring:
+  config:
+    activate:
+      on-profile: in-memory
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration
+      - org.springframework.boot.jdbc.autoconfigure.DataSourceTransactionManagerAutoConfiguration
+      - org.springframework.boot.flyway.autoconfigure.FlywayAutoConfiguration
+
+mediation:
+  persistence-mode: in-memory

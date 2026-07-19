@@ -1,0 +1,61 @@
+name: Verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  application:
+    name: Java and PostgreSQL
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: mediation
+          POSTGRES_USER: mediation
+          POSTGRES_PASSWORD: mediation
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mediation -d mediation"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: jdbc:postgresql://localhost:5432/mediation
+      DATABASE_USERNAME: mediation
+      DATABASE_PASSWORD: mediation
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      - name: Verify unit and PostgreSQL integration tests
+        run: mvn --batch-mode --no-transfer-progress --file software/service-mediation-layer/pom.xml verify -Ppostgres-integration
+
+  infrastructure:
+    name: AWS CDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: infrastructure/ecs/pnpm-lock.yaml
+      - name: Install dependencies
+        working-directory: infrastructure/ecs
+        run: pnpm install --frozen-lockfile
+      - name: Compile, test, and synthesize
+        working-directory: infrastructure/ecs
+        run: pnpm run build && pnpm test && pnpm run synth

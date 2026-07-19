@@ -22,8 +22,10 @@ This increment provides:
 - semantic request fingerprinting;
 - same-key/same-request idempotent replay;
 - same-key/different-request conflict detection;
-- an explicitly configured in-memory reference adapter;
+- a database-free in-memory reference adapter;
+- Flyway-managed PostgreSQL workflow, idempotency, transition, and outbox tables;
+- atomic PostgreSQL writes with concurrent-idempotency and rollback tests;
 - liveness/readiness endpoints for ECS;
 - domain and application tests.
 
-PostgreSQL durability, outbox publication, participant adapters, and recovery polling are intentionally subsequent increments.
+The outbox relay that publishes pending rows, participant adapters, and recovery polling are intentionally subsequent increments. See the [verification runbook](../../docs/implementation/verify-design.md) for exact local and CI commands.

@@ -1,6 +1,8 @@
 spring:
   application:
     name: service-mediation-layer
+  profiles:
+    default: in-memory
   lifecycle:
     timeout-per-shutdown-phase: 20s
 
@@ -24,7 +26,6 @@ management:
       enabled: true
 
 mediation:
-  persistence-mode: ${MEDIATION_PERSISTENCE_MODE:in-memory}
   recovery-batch-size: ${MEDIATION_RECOVERY_BATCH_SIZE:50}
   recovery-lease-duration: ${MEDIATION_RECOVERY_LEASE_DURATION:PT30S}
 

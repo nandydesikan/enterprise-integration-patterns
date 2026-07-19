@@ -10,6 +10,7 @@ import {
   aws_ecs as ecs,
   aws_ecs_patterns as ecsPatterns,
   aws_logs as logs,
+  aws_rds as rds,
 } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 
@@ -31,6 +32,11 @@ export class ServiceMediationStack extends Stack {
           subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
           cidrMask: 24,
         },
+        {
+          name: 'data',
+          subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
+          cidrMask: 24,
+        },
       ],
     });
 
@@ -42,6 +48,28 @@ export class ServiceMediationStack extends Stack {
     const logGroup = new logs.LogGroup(this, 'ApplicationLogs', {
       retention: logs.RetentionDays.ONE_MONTH,
       removalPolicy: RemovalPolicy.DESTROY,
+    });
+
+    const database = new rds.DatabaseInstance(this, 'WorkflowDatabase', {
+      engine: rds.DatabaseInstanceEngine.postgres({
+        version: rds.PostgresEngineVersion.VER_17_9,
+      }),
+      databaseName: 'mediation',
+      credentials: rds.Credentials.fromGeneratedSecret('mediation_app'),
+      instanceType: ec2.InstanceType.of(
+        ec2.InstanceClass.T4G,
+        ec2.InstanceSize.MICRO,
+      ),
+      vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+      allocatedStorage: 20,
+      maxAllocatedStorage: 100,
+      storageEncrypted: true,
+      multiAz: false,
+      publiclyAccessible: false,
+      backupRetention: Duration.days(7),
+      deletionProtection: false,
+      removalPolicy: RemovalPolicy.SNAPSHOT,
     });
 
     const service = new ecsPatterns.ApplicationLoadBalancedFargateService(this, 'Service', {
@@ -78,9 +106,14 @@ export class ServiceMediationStack extends Stack {
           { platform: ecrAssets.Platform.LINUX_ARM64 },
         ),
         environment: {
-          MEDIATION_PERSISTENCE_MODE: 'in-memory',
+          SPRING_PROFILES_ACTIVE: 'postgres',
+          DATABASE_URL: `jdbc:postgresql://${database.dbInstanceEndpointAddress}:${database.dbInstanceEndpointPort}/mediation`,
           MEDIATION_RECOVERY_BATCH_SIZE: '50',
           MEDIATION_RECOVERY_LEASE_DURATION: 'PT30S',
+        },
+        secrets: {
+          DATABASE_USERNAME: ecs.Secret.fromSecretsManager(database.secret!, 'username'),
+          DATABASE_PASSWORD: ecs.Secret.fromSecretsManager(database.secret!, 'password'),
         },
         logDriver: ecs.LogDrivers.awsLogs({
           logGroup,
@@ -88,6 +121,11 @@ export class ServiceMediationStack extends Stack {
         }),
       },
     });
+
+    database.connections.allowDefaultPortFrom(
+      service.service,
+      'Permit the mediation tasks to reach PostgreSQL',
+    );
 
     service.targetGroup.configureHealthCheck({
       path: '/actuator/health/readiness',
@@ -109,6 +147,11 @@ export class ServiceMediationStack extends Stack {
     new CfnOutput(this, 'ServiceUrl', {
       value: `http://${service.loadBalancer.loadBalancerDnsName}`,
       description: 'Public ALB endpoint for the reference service',
+    });
+
+    new CfnOutput(this, 'DatabaseSecretArn', {
+      value: database.secret!.secretArn,
+      description: 'Secrets Manager ARN for the generated PostgreSQL credentials',
     });
   }
 }

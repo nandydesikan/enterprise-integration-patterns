@@ -45,6 +45,17 @@ public final class ReturnWorkflow {
         );
     }
 
+    public static ReturnWorkflow rehydrate(
+            ReturnWorkflowId id,
+            String returnRequestId,
+            ReturnWorkflowPhase phase,
+            WorkflowStatus status,
+            Instant createdAt,
+            Instant updatedAt
+    ) {
+        return new ReturnWorkflow(id, returnRequestId, phase, status, createdAt, updatedAt);
+    }
+
     public void transitionTo(ReturnWorkflowPhase nextPhase, Instant now) {
         Objects.requireNonNull(nextPhase, "nextPhase");
         Objects.requireNonNull(now, "now");

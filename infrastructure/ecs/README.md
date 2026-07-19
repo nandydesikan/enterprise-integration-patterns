@@ -9,6 +9,9 @@ This AWS CDK application defines the runtime boundary for the service-mediation 
 - an ECS cluster with Container Insights;
 - an Application Load Balancer and readiness target check;
 - a two-task Fargate service with deployment rollback;
+- an encrypted RDS PostgreSQL instance in isolated subnets;
+- generated database credentials injected from Secrets Manager;
+- a security-group rule limited to ECS task-to-database traffic;
 - a deterministic Linux ARM64 image and Fargate runtime contract;
 - task-level container health checks;
 - CPU target-tracking between two and six tasks;
@@ -16,11 +19,11 @@ This AWS CDK application defines the runtime boundary for the service-mediation 
 - CDK-managed least-privilege execution and task roles;
 - a Docker image asset built from `software/service-mediation-layer`.
 
-The task role receives no application permissions in this increment because the service does not call AWS APIs. Permissions should be added only alongside a concrete adapter that requires them.
+The task role receives no application permissions because the service does not call AWS APIs. ECS retrieves the database secret through its execution role; application code receives the values as runtime configuration.
 
 ## Important scope boundary
 
-The deployed first increment uses the explicit `in-memory` adapter. It is suitable for validating packaging, health behavior, deployment rollback, and API shape—not for production workflow durability. PostgreSQL and its security-group/secret wiring arrive with the persistence increment.
+The deployed profile uses PostgreSQL and Flyway for durable ingress. For demonstration compactness, the generated database owner credential runs both migrations and the service. A production promotion would split migration and least-privilege runtime roles. Multi-AZ, deletion protection, private database administration, secret rotation, alarms, and the outbox relay also remain explicit production-hardening decisions rather than hidden demo claims.
 
 ## Prerequisites
 
@@ -42,7 +45,7 @@ pnpm run diff
 pnpm run deploy
 ```
 
-`cdk diff` is the review gate. Do not deploy this demonstration stack blindly: it creates billable resources, including a NAT gateway, load balancer, Fargate tasks, and logs.
+`cdk diff` is the review gate. Do not deploy this demonstration stack blindly: it creates billable resources, including a NAT gateway, load balancer, Fargate tasks, RDS instance, and logs.
 
 ## Why CDK is separate
 
